@@ -3,6 +3,7 @@ import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 from scipy.linalg import cho_solve, cho_factor
 from scipy.spatial.distance import cdist
+from kernels.rbf_kernel import RBFKernel
 
 # === Online GP 模型（LoG-GP 无先验） ===
 class OnlineGP:
@@ -13,19 +14,20 @@ class OnlineGP:
         self.variance = variance
         self.X = []
         self.y = []
+        self.kernel = RBFKernel(lengthscale=lengthscale, variance=variance)
 
-    def rbf_kernel(self, X1, X2):
-        dists = cdist(X1 / self.lengthscale, X2 / self.lengthscale, metric='sqeuclidean')
-        return self.variance * np.exp(-0.5 * dists)
+    # def rbf_kernel(self, X1, X2):
+    #     dists = cdist(X1 / self.lengthscale, X2 / self.lengthscale, metric='sqeuclidean')
+    #     return self.variance * np.exp(-0.5 * dists)
 
     def predict(self, x_star):
         if len(self.X) == 0:
             return 0.0, 1.0
         X = np.array(self.X)
         y = np.array(self.y)
-        K = self.rbf_kernel(X, X) + self.noise * np.eye(len(X))
-        k_star = self.rbf_kernel(X, np.atleast_2d(x_star))
-        k_star_star = self.rbf_kernel(np.atleast_2d(x_star), np.atleast_2d(x_star))[0, 0]
+        K = self.kernel(X, X) + self.noise * np.eye(len(X))
+        k_star = self.kernel(X, np.atleast_2d(x_star))
+        k_star_star = self.kernel(np.atleast_2d(x_star), np.atleast_2d(x_star))[0, 0]
         K_chol = cho_factor(K)
         alpha = cho_solve(K_chol, y)
         mean = k_star.T @ alpha
@@ -79,6 +81,7 @@ for x_i, y_i in zip(X_online, y_online):
     history_stds.append(np.array(std))
     if gp.X:
         added_points.append((x_i.item(), y_i))
+
 
 # === 动画部分 ===
 fig, ax = plt.subplots(figsize=(10, 5))
