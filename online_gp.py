@@ -6,7 +6,7 @@ from scipy.spatial.distance import cdist
 
 # === Online GP 模型（LoG-GP 无先验） ===
 class OnlineGP:
-    def __init__(self, noise=1e-4, max_points=30, lengthscale=1.5, variance=1.0):
+    def __init__(self, noise=1e-4, max_points=30, lengthscale=2, variance=1.0):
         self.noise = noise
         self.max_points = max_points
         self.lengthscale = lengthscale
@@ -32,10 +32,17 @@ class OnlineGP:
         v = cho_solve(K_chol, k_star)
         var = k_star_star - k_star.T @ v
         return mean.item(), np.clip(var, 1e-6, 1e6)
+    
+    def update(self, x_new, y_new):
+        self.X.append(np.array(x_new))
+        self.y.append(y_new)
+        if len(self.X) > self.max_points:
+            self.X.pop(0)
+            self.y.pop(0)
 
-    def is_informative(self, x_new, y_new, threshold=0.01):
-        _, var = self.predict(x_new)
-        return var > threshold
+    # def is_informative(self, x_new, y_new, threshold=0.01):
+    #     _, var = self.predict(x_new)
+    #     return var > threshold
 
     # def update(self, x_new, y_new):
     #     if self.is_informative(x_new, y_new):
@@ -47,13 +54,6 @@ class OnlineGP:
     #             self.y.pop(0)
     #     else:
     #         print(f"Point {x_new} is not informative enough.")
-    
-    def update(self, x_new, y_new):
-        self.X.append(np.array(x_new))
-        self.y.append(y_new)
-        if len(self.X) > self.max_points:
-            self.X.pop(0)
-            self.y.pop(0)
         
 
 # === 数据生成 ===
@@ -65,7 +65,7 @@ X_test = np.linspace(0, 5, 200).reshape(-1, 1)
 y_true = np.sin(X_test).ravel()
 
 # === 初始化模型 ===
-gp = OnlineGP(max_points=30, lengthscale=1.5)
+gp = OnlineGP(max_points=50, lengthscale=2.5)
 
 # === 模拟在线过程并记录预测历史 ===
 history_preds = []
