@@ -2,6 +2,10 @@ import torch
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
+
+import os
+import sys
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from kernels.rbf_kernel import RBFKernel
 
 # === Online GPR 模型 ===
@@ -75,80 +79,3 @@ class OnlineGPTorch(torch.nn.Module):
         n = len(X_train)
         ll = -0.5 * y_train.t().matmul(alpha).squeeze() - log_det - 0.5 * n * torch.log(torch.tensor(2 * np.pi, dtype=torch.float64))
         return ll
-    
-# 数据生成
-# np.random.seed(1)
-X_online = (np.random.rand(100) * 5).reshape(-1, 1)
-y_online = np.sin(X_online).ravel() + 0.2 * np.random.randn(100)
-X_test = np.linspace(0, 5, 200).reshape(-1, 1)
-y_true = np.sin(X_test).ravel()
-
-# 记录每一帧的预测历史
-history_means = []
-history_stds = []
-used_points = []
-
-# 初始化模型、优化器
-gp = OnlineGPTorch(max_points=50)
-optimizer = torch.optim.Adam(gp.parameters(), lr=0.05)
-X_test_tensor = torch.tensor(X_test, dtype=torch.float64)
-
-# 执行在线学习并记录中间状态
-for i, (x_i, y_i) in enumerate(zip(X_online, y_online)):
-    gp.update(x_i, y_i)
-    used_points.append((x_i.item(), y_i))
-
-    if len(gp.X) >= 2:
-        optimizer.zero_grad()
-        loss = -gp.marginal_log_likelihood()
-        loss.backward()
-        optimizer.step()
-
-    # 每若干步存一次帧数据（减轻内存压力）
-    if i % 2 == 0:
-        means, stds = [], []
-        for x_star in X_test:
-            mean, std = gp.predict(torch.tensor(x_star.reshape(1, -1), dtype=torch.float64))
-            means.append(mean)
-            stds.append(std)
-        history_means.append(means)
-        history_stds.append(stds)
-
-# === 创建动画 ===
-fig, ax = plt.subplots(figsize=(10, 5))
-line_pred, = ax.plot([], [], 'b', label='Predicted mean')
-line_true, = ax.plot(X_test, y_true, 'g--', label='True function')
-scatter_pts = ax.scatter([], [], c='k', s=20, label='Training points')
-fill = None
-
-def init():
-    ax.set_xlim(0, 5)
-    ax.set_ylim(-2, 2)
-    return line_pred, scatter_pts
-
-def update(frame):
-    global fill
-    if fill:
-        fill.remove()
-
-    y_pred = history_means[frame]
-    y_std = history_stds[frame]
-    line_pred.set_data(X_test.ravel(), y_pred)
-    fill = ax.fill_between(X_test.ravel(),
-                           np.array(y_pred) - 2 * np.array(y_std),
-                           np.array(y_pred) + 2 * np.array(y_std),
-                           alpha=0.2, color='blue')
-
-    pts = np.array(used_points[:(frame * 2) + 1])  # 每2步存一次
-    scatter_pts.set_offsets(pts)
-    return line_pred, scatter_pts
-
-ani = FuncAnimation(fig, update, frames=len(history_means),
-                    init_func=init, blit=False, repeat=False, interval=300)
-
-plt.title("Online GPR Animation (Pointwise Prediction)")
-plt.xlabel("x")
-plt.ylabel("y")
-plt.legend()
-plt.tight_layout()
-plt.show()

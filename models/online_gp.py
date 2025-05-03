@@ -3,6 +3,10 @@ import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 from scipy.linalg import cho_solve, cho_factor
 from scipy.spatial.distance import cdist
+
+import os
+import sys
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from kernels.rbf_kernel import RBFKernel
 
 # === Online GP 模型（LoG-GP 无先验） ===
