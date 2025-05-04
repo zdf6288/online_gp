@@ -7,10 +7,18 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 from models.on_loggp_pytorch import LoGGP_PyTorch
 from tools.error_bound import ErrorBoundCalculator
 
-# 初始化模型
+#parameters
 x_dim, y_dim = 1, 1
-model = LoGGP_PyTorch(x_dim=x_dim, y_dim=y_dim, max_data_per_expert=200, max_experts=1)
-err_calc = ErrorBoundCalculator(input_dim=1)
+learning_rate = 0.0001
+optimize_steps = 10
+max_experts = 1
+max_data_per_expert = 200
+
+#initialize model
+model = LoGGP_PyTorch(x_dim=x_dim, y_dim=y_dim, max_data_per_expert=max_data_per_expert,
+                      lr=learning_rate, steps=optimize_steps,
+                      max_experts=max_experts)
+err_calc = ErrorBoundCalculator(input_dim=1) #error bound calculator
 
 # 构造训练数据
 X_train = np.random.uniform(0, 5, 100).reshape(-1, 1)
@@ -41,8 +49,6 @@ def init():
     line_pred.set_data([], [])
     scat_train.set_offsets(np.empty((0, 2)))
     return line_pred, scat_train
-
-import numpy as np
 
 def update(frame):
     global fill_conf, fill_bound

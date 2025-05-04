@@ -3,55 +3,91 @@ import torch
 import torch.nn as nn
 import random
 
+import os
+import sys
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+from kernels.rbf_kernel import RBFKernel
+
+# class RBFKernel:
+#     def __init__(self, lengthscale=1.0, variance=1.0):
+#         self.lengthscale = torch.tensor(lengthscale, dtype=torch.float64)
+#         self.variance = torch.tensor(variance, dtype=torch.float64)
+
+#     def __call__(self, X1, X2):
+#         device = X1.device
+#         lengthscale = self.lengthscale.to(device)
+#         variance = self.variance.to(device)
+
+#         X1 = X1 / lengthscale
+#         X2 = X2 / lengthscale
+#         sqdist = torch.cdist(X1, X2).pow(2)
+#         return variance * torch.exp(-0.5 * sqdist)
+
+
+def to_tensor_2d(x, device):
+    if isinstance(x, np.ndarray):
+        x = torch.from_numpy(x)
+    elif not isinstance(x, torch.Tensor):
+        raise TypeError("Input must be a numpy.ndarray or torch.Tensor")
+    if x.ndim == 1:
+        x = x.unsqueeze(0)
+    elif x.ndim != 2:
+        raise ValueError(f"Expected 1D or 2D input, got shape {x.shape}")
+    return x.double().to(device)
+
+
 class LoGGP_PyTorch(nn.Module):
-    def __init__(self, x_dim, y_dim, max_data_per_expert=50, max_experts=4):
+    def __init__(self, x_dim, y_dim, max_data_per_expert=50, max_experts=4, lr=0.0005, steps=10, device=None):
         super().__init__()
+        self.device = device or torch.device("cpu")
         self.x_dim = x_dim
         self.y_dim = y_dim
         self.max_data = max_data_per_expert
         self.max_experts = max_experts
-        self.wo = 10
+        self.wo = 300
 
         self.X = np.zeros((x_dim, max_data_per_expert * max_experts), dtype=float)
         self.Y = np.zeros((y_dim, max_data_per_expert * max_experts), dtype=float)
         self.K = np.zeros((max_data_per_expert * y_dim, max_data_per_expert * max_experts), dtype=float)
         self.alpha = np.zeros((max_data_per_expert * y_dim, max_experts), dtype=float)
 
-        self.count = 0
+        self.count = 0 # Number of models
         self.localCount = np.zeros(2 * max_experts - 1, dtype=int)
-        self.medians = np.zeros(2 * max_experts - 1)
-        self.overlapD = np.zeros(2 * max_experts - 1, dtype=int)
-        self.overlapW = np.zeros(2 * max_experts - 1)
-        self.auxUbic = np.zeros(2 * max_experts - 1, dtype=int) - 1
-        self.auxUbic[0] = 0
-        self.children = np.zeros((2, 2 * max_experts - 1), dtype=int) - 1
+        self.medians = np.zeros(2 * max_experts - 1) # Median of the split
+        self.overlapD = np.zeros(2 * max_experts - 1, dtype=int) # Dimension of the split
+        self.overlapW = np.zeros(2 * max_experts - 1) # Width of the split
+        self.auxUbic = np.zeros(2 * max_experts - 1, dtype=int) - 1 # Auxiliary index for the model
+        self.auxUbic[0] = 0 # Root node
+        self.children = np.zeros((2, 2 * max_experts - 1), dtype=int) - 1 # Children of the model
 
         self.model_params = {}
         self.model_optimizers = {}
 
+        self.lr = lr
+        self.optimize_steps = steps
+
     def init_model_params(self, model_id):
-        log_sigma_f = nn.Parameter(torch.zeros(self.y_dim))
-        log_sigma_n = nn.Parameter(torch.full((self.y_dim,), -2.0))
-        log_lengthscale = nn.Parameter(torch.zeros((self.x_dim, self.y_dim)))
+        log_sigma_f = nn.Parameter(torch.randn(self.y_dim, device=self.device) * 0.1)
+        log_sigma_n = nn.Parameter(torch.randn(self.y_dim, device=self.device) * 0.1 - 2.0)
+        log_lengthscale = nn.Parameter(torch.randn((self.x_dim, self.y_dim), device=self.device) * 0.1)
         self.model_params[model_id] = {
             'log_sigma_f': log_sigma_f,
             'log_sigma_n': log_sigma_n,
             'log_lengthscale': log_lengthscale
         }
-        optimizer = torch.optim.Adam([log_sigma_f, log_sigma_n, log_lengthscale], lr=0.0005)
+        optimizer = torch.optim.Adam([log_sigma_f, log_sigma_n, log_lengthscale], lr=self.lr)
         self.model_optimizers[model_id] = optimizer
 
     def kernel(self, Xi, Xj, out, model_id):
         params = self.model_params[model_id]
-        sigma_f = torch.exp(params['log_sigma_f'][out])
-        lengthscale = torch.exp(params['log_lengthscale'][:, out])
-        if Xi.ndim == 1:
-            sqdist = torch.sum(((Xi - Xj) / lengthscale) ** 2)
-            return sigma_f**2 * torch.exp(-0.5 * sqdist)
-        else:
-            diff = (Xi.T - Xj) / lengthscale
-            return sigma_f**2 * torch.exp(-0.5 * torch.sum(diff ** 2, axis=1))
+        variance = torch.exp(params['log_sigma_f'][out]) ** 2
+        lengthscale = torch.exp(params['log_lengthscale'][:, out]).detach().cpu().numpy()
+        rbf = RBFKernel(lengthscale=lengthscale, variance=variance.item())
+        Xi = to_tensor_2d(Xi, self.device)
+        Xj = to_tensor_2d(Xj, self.device)
+        return rbf(Xi, Xj).squeeze()
 
+    # Activation function for the split
     def activation(self, x, model):
         if self.children[0, model] == -1:
             return 0
@@ -65,125 +101,171 @@ class LoGGP_PyTorch(nn.Module):
         else:
             return 0
 
-    def update_point(self, x, y):
+    def update_point(self, x, y, optimize=True):
         model = 0
         while self.children[0, model] != -1:
             pL = self.activation(x, model)
+            # Randomly choose the child node based on the activation probability
             if pL >= random.random() and pL != 0:
                 model = self.children[0, model]
             else:
                 model = self.children[1, model]
-        self.add_point(x, y, model)
+        self.add_point(x, y, model, optimize)
 
-    def add_point(self, x, y, model):
-        print(f"Adding point to model {model}: {x}, {y}")
+    def add_point(self, x, y, model, optimize=True):
         if model not in self.model_params:
             self.init_model_params(model)
-
         pos = self.auxUbic[model]
         idx = self.localCount[model]
         if (pos * self.max_data + idx) >= self.X.shape[1]:
-            print("Index overflow, skipping point.")
             return
-
         self.X[:, pos * self.max_data + idx] = x
         self.Y[:, pos * self.max_data + idx] = y
         self.localCount[model] += 1
         self.update_kernel(x, y, model)
-
         if self.localCount[model] == self.max_data:
             self.divide(model)
-
-        self.optimize_model(model)
+        if optimize:
+            self.optimize_model(model)
 
     def update_kernel(self, x, y, model):
         pos = self.auxUbic[model]
         l = self.localCount[model]
         if l > self.max_data:
-            print("Exceeded max_data in model, skipping kernel update.")
             return
         for p in range(self.y_dim):
             sigma_n = torch.exp(self.model_params[model]['log_sigma_n'][p])
-            kx = self.kernel(torch.tensor(x), torch.tensor(x), p, model).item()
+            kx = self.kernel(x, x, p, model).item()
             if l == 1:
-                self.K[p * self.max_data, pos * self.max_data] = kx + sigma_n.item()**2
+                self.K[p * self.max_data, pos * self.max_data] = kx + sigma_n.item()**2 + 1e-6
                 self.alpha[p * self.max_data, pos] = self.Y[p, pos * self.max_data] / kx
             else:
                 auxX = self.X[:, pos * self.max_data: pos * self.max_data + l]
                 auxY = self.Y[p, pos * self.max_data: pos * self.max_data + l]
-                b = self.kernel(torch.tensor(auxX), torch.tensor(x), p, model).detach().numpy()
-                b[-1] += sigma_n.item()**2
+                b = self.kernel(auxX.T, x, p, model).detach().cpu().numpy()
+                b[-1] += sigma_n.item()**2 + 1e-6
                 auxOut = p * self.max_data
                 self.K[auxOut + l - 1, pos * self.max_data: pos * self.max_data + l - 1] = b[0:-1]
                 self.K[auxOut: auxOut + l, pos * self.max_data + l - 1] = b
-                self.alpha[auxOut: auxOut + l, pos] = np.linalg.solve(
-                    self.K[auxOut: auxOut + l, pos * self.max_data: pos * self.max_data + l],
-                    auxY
-                )
+                K_sub = self.K[auxOut: auxOut + l, pos * self.max_data: pos * self.max_data + l]
+                K_sub += np.eye(l) * 1e-6
+                self.alpha[auxOut: auxOut + l, pos] = np.linalg.solve(K_sub, auxY)
 
     def divide(self, model):
-        if self.auxUbic.max() + 1 >= self.max_experts:
-            print("No room for more divisions")
-            return
+            if self.auxUbic[-1] != -1:
+                print("no room for more divisions")
+                return
+            # compute widths in all dimensions
+            width = self.X[:, self.auxUbic[model] * self.max_data: self.auxUbic[model] *
+                                                            self.max_data + self.max_data].max(axis=1) - self.X[:,
+                                                                                                self.auxUbic[model] *
+                                                                                                self.max_data: self.auxUbic[
+                                                                                                            model] * self.max_data + self.max_data].min(
+                axis=1)
 
-        pos = self.auxUbic[model]
-        data = self.X[:, pos * self.max_data: pos * self.max_data + self.max_data]
-        widths = data.max(axis=1) - data.min(axis=1)
-        cutD = np.argmax(widths)
-        width = widths[cutD]
-        mP = (data[cutD].max() + data[cutD].min()) / 2.0
-        o = width / self.wo if width > 0 else 0.1
+            # obtain cutting dimension
+            cutD = np.argmax(width)
+            width = width.max()
+            # compute hyperplane
+            mP = (self.X[cutD, self.auxUbic[model] * self.max_data: self.auxUbic[model] *
+                                                            self.max_data + self.max_data].max() + self.X[cutD,
+                                                                                            self.auxUbic[model] *
+                                                                                            self.max_data: self.auxUbic[
+                                                                                                        model] * self.max_data + self.max_data].min()) / 2
 
-        iL, iR = [], []
-        for i in range(self.max_data):
-            xD = data[cutD, i]
-            if xD < mP - 0.5 * o:
-                iL.append(i)
-            elif xD > mP + 0.5 * o:
-                iR.append(i)
+            # get overlapping region
+            o = width / self.wo
+            if o == 0:
+                o = 0.1
+
+            self.medians[model] = mP  # set model hyperplane
+            self.overlapD[model] = cutD  # cut dimension
+            self.overlapW[model] = o  # width of overlap
+
+            xL = np.zeros([self.x_dim, self.max_data], dtype=float)
+            xR = np.zeros([self.x_dim, self.max_data], dtype=float)
+            yL = np.zeros([self.y_dim, self.max_data], dtype=float)
+            yR = np.zeros([self.y_dim, self.max_data], dtype=float)
+
+            lcount = 0
+            rcount = 0
+
+            iL = np.zeros(self.max_data, dtype=int)
+            iR = np.zeros(self.max_data, dtype=int)
+
+            for i in range(self.max_data):
+                xD = self.X[cutD, self.auxUbic[model] * self.max_data + i]
+                if xD < mP - 0.5 * o:
+                    xL[:, lcount] = self.X[:, self.auxUbic[model] * self.max_data + i]
+                    yL[:, lcount] = self.Y[:, self.auxUbic[model] * self.max_data + i]
+                    iL[lcount] = i
+                    lcount += 1
+                elif xD >= mP - 0.5 * o and xD <= mP + 0.5 * o:  # if in overlapping
+                    pL = 0.5 + (xD - mP) / o  # prob. of being in left
+                    if pL >= random.random() and pL != 0:  # left selected
+                        xL[:, lcount] = self.X[:, self.auxUbic[model] * self.max_data + i]
+                        yL[:, lcount] = self.Y[:, self.auxUbic[model] * self.max_data + i]
+                        iL[lcount] = i
+                        lcount += 1
+                    else:
+                        xR[:, rcount] = self.X[:, self.auxUbic[model] * self.max_data + i]
+                        yR[:, rcount] = self.Y[:, self.auxUbic[model] * self.max_data + i]
+                        iR[rcount] = i
+                        rcount += 1
+                elif xD > mP + 0.5 * o:  # if in right
+                    xR[:, rcount] = self.X[:, self.auxUbic[model] * self.max_data + i]
+                    yR[:, rcount] = self.Y[:, self.auxUbic[model] * self.max_data + i]
+                    iR[rcount] = i
+                    rcount += 1
+            self.localCount[model] = 0
+            # update counter
+            if self.count == 0:
+                self.count += 1
             else:
-                pL = 0.5 + (xD - mP) / o
-                if random.random() < pL:
-                    iL.append(i)
-                else:
-                    iR.append(i)
-
-        newL = self.count + 1 if self.count > 0 else 1
-        newR = newL + 1
-        self.children[0, model] = newL
-        self.children[1, model] = newR
-        self.medians[model] = mP
-        self.overlapD[model] = cutD
-        self.overlapW[model] = o
-
-        self.localCount[newL] = len(iL)
-        self.localCount[newR] = len(iR)
-        self.auxUbic[newL] = self.auxUbic[model]
-        self.auxUbic[newR] = self.auxUbic.max() + 1
-        self.auxUbic[model] = -1
-
-        for leaf in (newL, newR):
-            if leaf not in self.model_params:
-                self.init_model_params(leaf)
-
-        def move_data(indices, leaf):
-            newX = self.X[:, pos * self.max_data + np.array(indices)]
-            newY = self.Y[:, pos * self.max_data + np.array(indices)]
-            new_pos = self.auxUbic[leaf]
-            self.X[:, new_pos * self.max_data: new_pos * self.max_data + len(indices)] = newX
-            self.Y[:, new_pos * self.max_data: new_pos * self.max_data + len(indices)] = newY
+                self.count += 2
+            # assign children
+            self.children[0, model] = self.count
+            self.children[1, model] = self.count + 1
+            # set local count of children
+            self.localCount[self.count] = lcount
+            self.localCount[self.count + 1] = rcount
+            self.auxUbic[self.count] = self.auxUbic[model]
+            self.auxUbic[self.count + 1] = self.auxUbic.max() + 1
+            # values for K permutation
+            order = np.concatenate((iL[0:lcount], iR[0:rcount]))
+            # update parameters of child models
             for p in range(self.y_dim):
-                K_full = self.K[p * self.max_data: (p + 1) * self.max_data,
-                                pos * self.max_data: pos * self.max_data + self.max_data]
-                newK = K_full[np.ix_(indices, indices)]
-                self.K[p * self.max_data: p * self.max_data + len(indices),
-                       new_pos * self.max_data: new_pos * self.max_data + len(indices)] = newK
-                self.alpha[p * self.max_data: p * self.max_data + len(indices), new_pos] = \
-                    np.linalg.solve(newK, self.Y[p, new_pos * self.max_data: new_pos * self.max_data + len(indices)])
-
-        move_data(iL, newL)
-        move_data(iR, newR)
-        self.count = newR
+                newK = self.K[p * self.max_data: (p + 1) * self.max_data, self.auxUbic[model] * self.max_data:
+                                                                self.auxUbic[model] * self.max_data + self.max_data]
+                # permute K
+                newK[range(self.max_data), :] = newK[order, :]
+                newK[:, range(self.max_data)] = newK[:, order]
+                # set child K
+                self.K[p * self.max_data: p * self.max_data + lcount, self.auxUbic[self.count] * self.max_data:
+                                                            self.auxUbic[self.count] * self.max_data + lcount] = newK[0: lcount,
+                                                                                                            0: lcount]
+                self.K[p * self.max_data: p * self.max_data + rcount, self.auxUbic[self.count + 1] * self.max_data:
+                                                            self.auxUbic[self.count + 1] * self.max_data + rcount] = \
+                    newK[lcount: self.max_data, lcount: self.max_data]
+                # set child alpha
+                self.alpha[p * self.max_data: p * self.max_data + lcount, self.auxUbic[self.count]] = \
+                    np.linalg.solve(newK[0: lcount, 0: lcount], yL[p, 0:lcount].transpose())
+                self.alpha[p * self.max_data: p * self.max_data + rcount, self.auxUbic[self.count + 1]] = \
+                    np.linalg.solve(newK[lcount: self.max_data, lcount: self.max_data], yR[p, 0:rcount].transpose())
+            # parent will not have more data:
+            self.auxUbic[model] = -1
+            # relocate X Y to children
+            self.X[:, self.auxUbic[self.count] * self.max_data:
+                    self.auxUbic[self.count] * self.max_data + self.max_data] = xL
+            self.X[:, self.auxUbic[self.count + 1] * self.max_data:
+                    self.auxUbic[self.count + 1] * self.max_data + self.max_data] = xR
+            self.Y[:, self.auxUbic[self.count] * self.max_data:
+                    self.auxUbic[self.count] * self.max_data + self.max_data] = yL
+            self.Y[:, self.auxUbic[self.count + 1] * self.max_data:
+                    self.auxUbic[self.count + 1] * self.max_data + self.max_data] = yR
+            
+            self.init_model_params(self.count)       # 初始化左子模型
+            self.init_model_params(self.count + 1)   # 初始化右子模型
 
     def predict(self, x, return_std=True):
         x = np.array(x)
@@ -217,21 +299,15 @@ class LoGGP_PyTorch(nn.Module):
                 X_sub = self.X[:, pos * self.max_data: pos * self.max_data + n_data]
                 alpha_sub = self.alpha[p * self.max_data: p * self.max_data + n_data, pos]
                 min_len = min(X_sub.shape[1], alpha_sub.shape[0])
-                kval = self.kernel(torch.tensor(X_sub[:, :min_len]), torch.tensor(x), p, model).detach().numpy()
+                kval = np.atleast_1d(self.kernel(X_sub[:, :min_len].T, x, p, model).detach().cpu().numpy())
                 pred = np.dot(kval, alpha_sub[:min_len])
                 out[p] += pred * probs[i]
-
-                # Variance approximation (optional): sum of k(x,x) - k.T @ K_inv @ k
-                k_xx = self.kernel(torch.tensor(x), torch.tensor(x), p, model).item()
-                var = k_xx - np.dot(kval[:min_len], kval[:min_len])  # Very rough
+                k_xx = self.kernel(x, x, p, model).item()
+                var = k_xx - np.dot(kval[:min_len], kval[:min_len])
                 out_var[p] += max(var, 1e-6) * probs[i]
+        return (out, np.sqrt(out_var)) if return_std else out
 
-        if return_std:
-            return out, np.sqrt(out_var)
-        return out
-
-    
-    def optimize_model(self, model_id, steps=3):
+    def optimize_model(self, model_id):
         pos = self.auxUbic[model_id]
         n = self.localCount[model_id]
         if n < 5:
@@ -240,7 +316,7 @@ class LoGGP_PyTorch(nn.Module):
         y_data = self.Y[:, pos * self.max_data: pos * self.max_data + n]
         for p in range(self.y_dim):
             optimizer = self.model_optimizers[model_id]
-            for _ in range(steps):
+            for _ in range(self.optimize_steps):
                 optimizer.zero_grad()
                 loss = self.nll_loss(x_data, y_data, model_id, p)
                 loss.backward()
@@ -251,16 +327,21 @@ class LoGGP_PyTorch(nn.Module):
         sigma_f = torch.exp(params['log_sigma_f'][output_dim])
         sigma_n = torch.exp(params['log_sigma_n'][output_dim])
         lengthscale = torch.exp(params['log_lengthscale'][:, output_dim])
-        X = torch.tensor(x_data.T, dtype=torch.float32)
-        Y = torch.tensor(y_data[output_dim], dtype=torch.float32).unsqueeze(-1)
+        X = torch.tensor(x_data.T, dtype=torch.float64, device=self.device)
+        Y = torch.tensor(y_data[output_dim], dtype=torch.float64, device=self.device).unsqueeze(-1)
         dists = ((X[:, None, :] - X[None, :, :]) / lengthscale).pow(2).sum(-1)
         K = sigma_f**2 * torch.exp(-0.5 * dists)
-        K += sigma_n**2 * torch.eye(K.size(0))
+        jitter = 1e-6
+        K += (sigma_n**2 + jitter) * torch.eye(K.size(0), dtype=torch.float64, device=self.device)
         try:
             L = torch.linalg.cholesky(K)
-            alpha = torch.cholesky_solve(Y, L)
-            log_det = 2.0 * torch.sum(torch.log(torch.diagonal(L)))
-            nll = 0.5 * Y.T @ alpha + 0.5 * log_det + 0.5 * X.shape[0] * torch.log(torch.tensor(2 * np.pi))
-            return nll.squeeze()
         except RuntimeError:
-            return torch.tensor(1e6)
+            K += 1e-4 * torch.eye(K.size(0), dtype=torch.float64, device=self.device)
+            try:
+                L = torch.linalg.cholesky(K)
+            except RuntimeError:
+                return torch.tensor(1e6, device=self.device)
+        alpha = torch.cholesky_solve(Y, L)
+        log_det = 2.0 * torch.sum(torch.log(torch.diagonal(L)))
+        nll = 0.5 * Y.T @ alpha + 0.5 * log_det + 0.5 * X.shape[0] * torch.log(torch.tensor(2 * np.pi))
+        return nll.squeeze()

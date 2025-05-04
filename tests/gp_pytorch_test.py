@@ -10,14 +10,13 @@ from models.online_gp_pytorch import OnlineGPTorch
 from tools.error_bound import ErrorBoundCalculator
 
 # === 数据生成 ===
-X_online = (np.random.rand(100) * 5).reshape(-1, 1)
-y_online = np.sin(X_online).ravel() + 0.2 * np.random.randn(100)
+X_online = (np.random.rand(200) * 5).reshape(-1, 1)
+y_online = np.sin(X_online).ravel() + 0.2 * np.random.randn(200)
 X_test = np.linspace(0, 5, 200).reshape(-1, 1)
 y_true = np.sin(X_test).ravel()
 
 # 初始化模型、误差计算器和优化器
-gp = OnlineGPTorch(max_points=50)
-optimizer = torch.optim.Adam(gp.parameters(), lr=0.05)
+gp = OnlineGPTorch(max_points=100)
 err_calc = ErrorBoundCalculator(input_dim=1)
 
 # 记录动画数据
@@ -31,12 +30,6 @@ for i, (x_i, y_i) in enumerate(zip(X_online, y_online)):
     gp.update(x_i, y_i)
     used_points.append((x_i.item(), y_i))
 
-    if len(gp.X) >= 2:
-        optimizer.zero_grad()
-        loss = -gp.marginal_log_likelihood()
-        loss.backward()
-        optimizer.step()
-
     if i % 2 == 0:
         means, stds, bounds = [], [], []
         for x_star in X_test:
@@ -47,6 +40,9 @@ for i, (x_i, y_i) in enumerate(zip(X_online, y_online)):
         history_means.append(means)
         history_stds.append(stds)
         history_bounds.append(bounds)
+
+
+
 
 # === 创建动画 ===
 fig, ax = plt.subplots(figsize=(10, 5))
