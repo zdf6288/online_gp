@@ -101,31 +101,96 @@ class LoGGP_PyTorch(nn.Module):
         else:
             return 0
 
-    def update_point(self, x, y, optimize=True):
+    # def update_point(self, x, y, optimize=True):
+    #     model = 0
+    #     while self.children[0, model] != -1:
+    #         pL = self.activation(x, model)
+    #         # Randomly choose the child node based on the activation probability
+    #         if pL >= random.random() and pL != 0:
+    #             model = self.children[0, model]
+    #         else:
+    #             model = self.children[1, model]
+    #     self.add_point(x, y, model, optimize)
+    
+    def update_point(self, x, y, step_id=None, optimize=True):
         model = 0
         while self.children[0, model] != -1:
             pL = self.activation(x, model)
-            # Randomly choose the child node based on the activation probability
             if pL >= random.random() and pL != 0:
                 model = self.children[0, model]
             else:
                 model = self.children[1, model]
-        self.add_point(x, y, model, optimize)
+        self.add_point(x, y, model, step_id=step_id, optimize=optimize)
+        
+    def entropy_based_replace(self, x, y, model):
+        """
+        替换当前专家中熵最小（即信息最少）的样本点为新样本。
+        用 GP 的后验方差作为熵近似指标。
+        """
+        pos = self.auxUbic[model]
+        n = self.max_data
+        min_entropy = float('inf')
+        replace_idx = -1
 
-    def add_point(self, x, y, model, optimize=True):
+        for i in range(n):
+            x_i = self.X[:, pos * self.max_data + i].reshape(-1, 1)
+            try:
+                # 计算 k(x_i, x_i)
+                k_xx = self.kernel(x_i.T, x_i.T, 0, model).item()
+
+                # 计算 k(X, x_i)
+                X_all = self.X[:, pos * self.max_data: pos * self.max_data + n]
+                kval = self.kernel(X_all.T, x_i.T, 0, model).cpu().numpy()
+
+                # 方差估计（避免负数）
+                var = k_xx - np.dot(kval, kval.T).item()
+                var = max(var, 1e-6)
+            except Exception:
+                var = 1e6  # 错误时视为最大信息
+
+            if var < min_entropy:
+                min_entropy = var
+                replace_idx = i
+
+        # 执行替换
+        self.X[:, pos * self.max_data + replace_idx] = x
+        self.Y[:, pos * self.max_data + replace_idx] = y
+        self.update_kernel(x, y, model)
+
+    def add_point(self, x, y, model, step_id=None, optimize=True, min_points_to_optimize=10, optimize_every=20):
         if model not in self.model_params:
             self.init_model_params(model)
         pos = self.auxUbic[model]
         idx = self.localCount[model]
-        if (pos * self.max_data + idx) >= self.X.shape[1]:
+        if idx >= self.max_data and self.auxUbic[-1] != -1:
+            # print("replacing point")
+            self.entropy_based_replace(x, y, model)
             return
-        self.X[:, pos * self.max_data + idx] = x
-        self.Y[:, pos * self.max_data + idx] = y
-        self.localCount[model] += 1
-        self.update_kernel(x, y, model)
-        if self.localCount[model] == self.max_data:
-            self.divide(model)
-        if optimize:
+
+        if idx >= self.max_data:
+            # 点数已满：替换冗余点
+            X_sub = self.X[:, pos * self.max_data: pos * self.max_data + self.max_data]
+            kmat = self.kernel(X_sub.T, X_sub.T, 0, model).detach().cpu().numpy()
+            sim = kmat.sum(axis=1) - np.diag(kmat)
+            remove_idx = np.argmax(sim)
+            self.X[:, pos * self.max_data + remove_idx] = x
+            self.Y[:, pos * self.max_data + remove_idx] = y
+            self.update_kernel(x, y, model)
+        else:
+            self.X[:, pos * self.max_data + idx] = x
+            self.Y[:, pos * self.max_data + idx] = y
+            self.localCount[model] += 1
+            self.update_kernel(x, y, model)
+            if self.localCount[model] == self.max_data:
+                self.divide(model)
+
+        # ✅ 控制优化策略
+        if (
+            optimize and
+            self.localCount[model] >= min_points_to_optimize and
+            step_id is not None and
+            step_id % optimize_every == 0
+        ):
             self.optimize_model(model)
 
     def update_kernel(self, x, y, model):
@@ -153,7 +218,7 @@ class LoGGP_PyTorch(nn.Module):
 
     def divide(self, model):
             if self.auxUbic[-1] != -1:
-                print("no room for more divisions")
+                # print("no room for more divisions")
                 return
             # compute widths in all dimensions
             width = self.X[:, self.auxUbic[model] * self.max_data: self.auxUbic[model] *
