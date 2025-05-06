@@ -2,42 +2,17 @@ import numpy as np
 import torch
 import torch.nn as nn
 import random
+from collections import deque
 
 import os
 import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from kernels.rbf_kernel import RBFKernel
-
-# class RBFKernel:
-#     def __init__(self, lengthscale=1.0, variance=1.0):
-#         self.lengthscale = torch.tensor(lengthscale, dtype=torch.float64)
-#         self.variance = torch.tensor(variance, dtype=torch.float64)
-
-#     def __call__(self, X1, X2):
-#         device = X1.device
-#         lengthscale = self.lengthscale.to(device)
-#         variance = self.variance.to(device)
-
-#         X1 = X1 / lengthscale
-#         X2 = X2 / lengthscale
-#         sqdist = torch.cdist(X1, X2).pow(2)
-#         return variance * torch.exp(-0.5 * sqdist)
-
-
-def to_tensor_2d(x, device):
-    if isinstance(x, np.ndarray):
-        x = torch.from_numpy(x)
-    elif not isinstance(x, torch.Tensor):
-        raise TypeError("Input must be a numpy.ndarray or torch.Tensor")
-    if x.ndim == 1:
-        x = x.unsqueeze(0)
-    elif x.ndim != 2:
-        raise ValueError(f"Expected 1D or 2D input, got shape {x.shape}")
-    return x.double().to(device)
+from tools.to_tensor_2d import to_tensor_2d
 
 
 class LoGGP_PyTorch(nn.Module):
-    def __init__(self, x_dim, y_dim, max_data_per_expert=50, max_experts=4, lr=0.0005, steps=10, device=None):
+    def __init__(self, x_dim, y_dim, max_data_per_expert=50, max_experts=4, lr=0.0005, steps=10, min_points_to_optimize=10, optimize_every=10, device=None, enable_variance_cache=False):
         super().__init__()
         self.device = device or torch.device("cpu")
         self.x_dim = x_dim
@@ -65,6 +40,15 @@ class LoGGP_PyTorch(nn.Module):
 
         self.lr = lr
         self.optimize_steps = steps
+        self.min_points_to_optimize = min_points_to_optimize
+        self.optimize_every = optimize_every
+        self.update_counters = {}  # 每个模型独立的更新计数器
+        
+        self.enable_variance_cache = enable_variance_cache
+        self.k_diag = np.full((y_dim * max_data_per_expert, max_experts), np.nan)  # 初始化为 NaN，表示未缓存
+    
+
+        self.data_index_queue = [deque() for _ in range(2 * max_experts - 1)]
 
     def init_model_params(self, model_id):
         log_sigma_f = nn.Parameter(torch.randn(self.y_dim, device=self.device) * 0.1)
@@ -76,6 +60,7 @@ class LoGGP_PyTorch(nn.Module):
             'log_lengthscale': log_lengthscale
         }
         optimizer = torch.optim.Adam([log_sigma_f, log_sigma_n, log_lengthscale], lr=self.lr)
+        self.update_counters[model_id] = 0
         self.model_optimizers[model_id] = optimizer
 
     def kernel(self, Xi, Xj, out, model_id):
@@ -100,19 +85,13 @@ class LoGGP_PyTorch(nn.Module):
             return 0.5 + (xD - mP) / o
         else:
             return 0
-
-    # def update_point(self, x, y, optimize=True):
-    #     model = 0
-    #     while self.children[0, model] != -1:
-    #         pL = self.activation(x, model)
-    #         # Randomly choose the child node based on the activation probability
-    #         if pL >= random.random() and pL != 0:
-    #             model = self.children[0, model]
-    #         else:
-    #             model = self.children[1, model]
-    #     self.add_point(x, y, model, optimize)
-    
+        
+    # Update the model with new point    
     def update_point(self, x, y, step_id=None, optimize=True):
+        # Step 1: predict first
+        pred, std = self.predict(x, return_std=True)
+
+        # Step 2: find target expert node
         model = 0
         while self.children[0, model] != -1:
             pL = self.activation(x, model)
@@ -120,101 +99,136 @@ class LoGGP_PyTorch(nn.Module):
                 model = self.children[0, model]
             else:
                 model = self.children[1, model]
+
+        # Step 3: update the model with new point
         self.add_point(x, y, model, step_id=step_id, optimize=optimize)
+        return pred, std
+
+        
+    def add_point(self, x, y, model, step_id=None, optimize=True):
+        if model not in self.model_params:
+            self.init_model_params(model)
+        pos = self.auxUbic[model]
+        idx = self.localCount[model]
+
+        if idx < self.max_data:
+            # 1. Expert not full → directly add
+            write_idx = idx
+            self.X[:, pos * self.max_data + idx] = x
+            self.Y[:, pos * self.max_data + idx] = y
+            self.localCount[model] += 1
+            self.data_index_queue[model].append(write_idx)
+            self.update_kernel(x, y, model)
+        
+        if idx == self.max_data:
+            if self.auxUbic[-1] != -1:
+                self.entropy_based_replace(x, y, model)
+            
+                # return
+                # replace_idx = self.data_index_queue[model].popleft()
+                # self.X[:, pos * self.max_data + replace_idx] = x
+                # self.Y[:, pos * self.max_data + replace_idx] = y
+                # self.update_kernel(x, y, model)
+                # self.data_index_queue[model].append(replace_idx)              
+            else:
+                #Full expert → divide
+                self.divide(model)
+
+        # 2. Update the model parameters
+        if optimize and self.localCount[model] >= self.min_points_to_optimize:
+            self.update_counters[model] += 1
+            if self.update_counters[model] % self.optimize_every == 0:
+                self.optimize_model(model)
+
         
     def entropy_based_replace(self, x, y, model):
         """
-        替换当前专家中熵最小（即信息最少）的样本点为新样本。
-        用 GP 的后验方差作为熵近似指标。
+        Replace the least informative point in the expert using entropy (variance) as proxy.
+        Now with k(xi, xi) cached to avoid recomputation.
         """
         pos = self.auxUbic[model]
         n = self.max_data
         min_entropy = float('inf')
         replace_idx = -1
 
+        X_all = self.X[:, pos * self.max_data: pos * self.max_data + n]
+        
         for i in range(n):
             x_i = self.X[:, pos * self.max_data + i].reshape(-1, 1)
-            try:
-                # 计算 k(x_i, x_i)
-                k_xx = self.kernel(x_i.T, x_i.T, 0, model).item()
 
-                # 计算 k(X, x_i)
+            if self.enable_variance_cache:
+                var = self.k_diag[0 * self.max_data + i, pos]
+                if not np.isnan(var):
+                    # 缓存命中，直接使用
+                    pass
+                else:
+                    # 重新计算并写入缓存
+                    k_xx = self.kernel(x_i.T, x_i.T, 0, model).item()
+                    X_all = self.X[:, pos * self.max_data: pos * self.max_data + n]
+                    kval = self.kernel(X_all.T, x_i.T, 0, model).cpu().numpy()
+                    var = k_xx - np.dot(kval, kval.T).item()
+                    var = max(var, 1e-6)
+                    self.k_diag[0 * self.max_data + i, pos] = var
+            else:
+                # 不使用缓存，直接计算
+                k_xx = self.kernel(x_i.T, x_i.T, 0, model).item()
                 X_all = self.X[:, pos * self.max_data: pos * self.max_data + n]
                 kval = self.kernel(X_all.T, x_i.T, 0, model).cpu().numpy()
-
-                # 方差估计（避免负数）
                 var = k_xx - np.dot(kval, kval.T).item()
                 var = max(var, 1e-6)
-            except Exception:
-                var = 1e6  # 错误时视为最大信息
 
             if var < min_entropy:
                 min_entropy = var
                 replace_idx = i
 
-        # 执行替换
+        # Replace data and update kernel
         self.X[:, pos * self.max_data + replace_idx] = x
         self.Y[:, pos * self.max_data + replace_idx] = y
         self.update_kernel(x, y, model)
 
-    def add_point(self, x, y, model, step_id=None, optimize=True, min_points_to_optimize=10, optimize_every=20):
-        if model not in self.model_params:
-            self.init_model_params(model)
-        pos = self.auxUbic[model]
-        idx = self.localCount[model]
-        if idx >= self.max_data and self.auxUbic[-1] != -1:
-            # print("replacing point")
-            self.entropy_based_replace(x, y, model)
-            return
-
-        if idx >= self.max_data:
-            # 点数已满：替换冗余点
-            X_sub = self.X[:, pos * self.max_data: pos * self.max_data + self.max_data]
-            kmat = self.kernel(X_sub.T, X_sub.T, 0, model).detach().cpu().numpy()
-            sim = kmat.sum(axis=1) - np.diag(kmat)
-            remove_idx = np.argmax(sim)
-            self.X[:, pos * self.max_data + remove_idx] = x
-            self.Y[:, pos * self.max_data + remove_idx] = y
-            self.update_kernel(x, y, model)
-        else:
-            self.X[:, pos * self.max_data + idx] = x
-            self.Y[:, pos * self.max_data + idx] = y
-            self.localCount[model] += 1
-            self.update_kernel(x, y, model)
-            if self.localCount[model] == self.max_data:
-                self.divide(model)
-
-        # ✅ 控制优化策略
-        if (
-            optimize and
-            self.localCount[model] >= min_points_to_optimize and
-            step_id is not None and
-            step_id % optimize_every == 0
-        ):
-            self.optimize_model(model)
 
     def update_kernel(self, x, y, model):
         pos = self.auxUbic[model]
-        l = self.localCount[model]
-        if l > self.max_data:
+        idx = self.localCount[model]
+        if idx > self.max_data:
             return
         for p in range(self.y_dim):
             sigma_n = torch.exp(self.model_params[model]['log_sigma_n'][p])
             kx = self.kernel(x, x, p, model).item()
-            if l == 1:
-                self.K[p * self.max_data, pos * self.max_data] = kx + sigma_n.item()**2 + 1e-6
+            self.k_diag[p * self.max_data + idx - 1, pos] = kx  # ✅ 缓存 k(xi, xi)
+            if idx == 1:
+                self.K[p * self.max_data, pos * self.max_data] = kx + sigma_n.item()**2
+                # self.K[p * self.max_data, pos * self.max_data] = kx + sigma_n.item()**2 + 1e-6
                 self.alpha[p * self.max_data, pos] = self.Y[p, pos * self.max_data] / kx
             else:
-                auxX = self.X[:, pos * self.max_data: pos * self.max_data + l]
-                auxY = self.Y[p, pos * self.max_data: pos * self.max_data + l]
+                auxX = self.X[:, pos * self.max_data: pos * self.max_data + idx]
+                auxY = self.Y[p, pos * self.max_data: pos * self.max_data + idx]
                 b = self.kernel(auxX.T, x, p, model).detach().cpu().numpy()
-                b[-1] += sigma_n.item()**2 + 1e-6
+                b[-1] += sigma_n.item()**2
+                # b[-1] += sigma_n.item()**2 + 1e-6
                 auxOut = p * self.max_data
-                self.K[auxOut + l - 1, pos * self.max_data: pos * self.max_data + l - 1] = b[0:-1]
-                self.K[auxOut: auxOut + l, pos * self.max_data + l - 1] = b
-                K_sub = self.K[auxOut: auxOut + l, pos * self.max_data: pos * self.max_data + l]
-                K_sub += np.eye(l) * 1e-6
-                self.alpha[auxOut: auxOut + l, pos] = np.linalg.solve(K_sub, auxY)
+                self.K[auxOut + idx - 1,
+                       pos * self.max_data: pos * self.max_data + idx - 1] = b[0:-1]
+                self.K[auxOut: auxOut + idx, 
+                       pos * self.max_data + idx - 1] = b
+                K_sub = self.K[auxOut: auxOut + idx, 
+                               pos * self.max_data: pos * self.max_data + idx]
+                # K_sub += np.eye(idx) * 1e-6
+                self.alpha[auxOut: auxOut + idx, pos] = np.linalg.solve(K_sub, auxY)
+            
+            # 缓存更新
+            if self.enable_variance_cache:
+                for j in range(idx):
+                    xj = self.X[:, pos * self.max_data + j].reshape(-1, 1)
+                    try:
+                        k_xx = self.kernel(xj.T, xj.T, p, model).item()
+                        X_all = self.X[:, pos * self.max_data: pos * self.max_data + idx]
+                        kval = self.kernel(X_all.T, xj.T, p, model).cpu().numpy()
+                        var = k_xx - np.dot(kval.T, kval).item()
+                        var = max(var, 1e-6)
+                    except:
+                        var = 1e6
+                    self.k_diag[p * self.max_data + j, pos] = var
 
     def divide(self, model):
             if self.auxUbic[-1] != -1:

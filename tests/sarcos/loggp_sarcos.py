@@ -33,81 +33,87 @@ def train_loggp_on_sarcos():
     print(f"Using device: {device}")
     X_train, Y_train, X_test, Y_test = load_sarcos_data()
     x_dim, y_dim = X_train.shape[1], 1
-    Y_train, Y_test = Y_train[:, :1], Y_test[:, :1]
+    Y_train, Y_test = Y_train[:, :1], Y_test[:, :1]  # 只预测第一个输出维度
 
-    max_data_per_expert = 300
-    max_experts = 32
-    lr = 0.005
-    steps = 10
-    batch_size = 200
-    reoptimize_every = 5
+    model = LoGGP_PyTorch(
+        x_dim, y_dim,
+        max_data_per_expert=50,
+        max_experts=64,
+        lr=0.001,
+        steps=5,
+        device=device,
+        min_points_to_optimize=10,
+        optimize_every=10
+    )
+
+    smse_list = []
+    preds = []
+    trues = []
+    sample_count = 0
+    max_samples = 5000
     pretrain_limit = 1000
-    iteration = 30
+    report_every = 100  # 每 N 个样本输出一次平均 SMSE
+    window_preds, window_trues = [], []
 
-    model = LoGGP_PyTorch(x_dim, y_dim,
-                          max_data_per_expert=max_data_per_expert,
-                          max_experts=max_experts,
-                          lr=lr,
-                          steps=steps,
-                          device=device)
-
-    batch_mses = []
-    no_room_batches = []
-
-    print("Training (up to 30 batches)...")
-    for batch_i in range(0, X_train.shape[0], batch_size):
-        batch_idx = batch_i // batch_size
-        if batch_idx >= iteration:
+    #开始训练
+    print("Training (sample-wise)...")
+    
+    for x, y in tqdm(zip(X_train, Y_train), total=min(len(X_train), max_samples)):
+        if sample_count >= max_samples:
             break
 
-        X_batch = X_train[batch_i:batch_i + batch_size]
-        Y_batch = Y_train[batch_i:batch_i + batch_size]
+        x = x.reshape(-1)
+        y = y.reshape(-1)
 
-        optimize = batch_i + batch_size <= pretrain_limit
-        count_before = model.count
+        # 1. 预测
+        pred, _ = model.predict(x, return_std=True)
+        preds.append(pred)
+        trues.append(y)
+        
+        window_preds.append(pred)
+        window_trues.append(y)
 
-        for step_id, (x, y) in enumerate(zip(X_batch, Y_batch)):
-            model.update_point(x, y, step_id=batch_i + step_id, optimize=optimize)
+        # 2. 更新模型
+        model.update_point(x, y, optimize=True)
 
-        if model.auxUbic[-1] != -1 and model.count == count_before:
-            no_room_batches.append(batch_idx)
+        # 3. 记录误差
+        smse = np.mean((pred - y) ** 2) / (np.var(y) + 1e-8)
+        smse_list.append(smse)
+        sample_count += 1
 
-        if (batch_idx + 1) % reoptimize_every == 0:
-            print(f"🔧 Re-optimizing hyperparameters at Batch {batch_idx + 1}")
-            for model_id in model.model_params.keys():
-                if model.children[0, model_id] == -1:
-                    model.optimize_model(model_id)
+        # 4. 每 report_every 样本输出 SMSE
+        if sample_count % report_every == 0:
+            window_preds_np = np.array(window_preds)
+            window_trues_np = np.array(window_trues)
+            mse = np.mean((window_preds_np - window_trues_np) ** 2)
+            variance = np.var(window_trues_np)
+            window_smse = mse / (variance + 1e-8)
+            print(f"[Samples {sample_count - report_every + 1}–{sample_count}] Average SMSE: {window_smse:.6f}")
+            window_preds.clear()
+            window_trues.clear()
 
-        batch_preds = [model.predict(x, return_std=False) for x in X_batch]
-        batch_preds = np.array(batch_preds)
-        batch_mse = np.mean((batch_preds - Y_batch) ** 2)
-        batch_mses.append(batch_mse)
-
-        print(f"Batch {batch_idx + 1}, Train MSE: {batch_mse:.4f}")
-
-    # 📈 Plot
-    plt.figure(figsize=(10, 5))
-    plt.plot(batch_mses, marker='o', label='Train MSE')
-    for b in no_room_batches:
-        plt.axvline(x=b, color='red', linestyle='--', alpha=0.6,
-                    label='No room for divide' if b == no_room_batches[0] else "")
-    plt.title("MSE vs. Batch Index (First 30 Batches) 1 Dimensional output")
-    plt.xlabel("Batch Index")
-    plt.ylabel("Mean Squared Error")
+    # 绘制训练误差
+    plt.figure(figsize=(10, 4))
+    plt.plot(smse_list, label='Sample-wise SMSE', alpha=0.7)
+    plt.title("Per-sample SMSE During Online Training")
+    plt.xlabel("Sample Index")
+    plt.ylabel("SMSE")
     plt.grid(True)
     plt.legend()
     plt.tight_layout()
-    plt.savefig("mse_vs_batch_30_batches.png")
+    plt.savefig("train_smse_per_sample.png")
     plt.show()
 
-    # 🧪 Test
+    # 测试阶段
     print("Testing...")
     predictions = [model.predict(x, return_std=False) for x in tqdm(X_test)]
     predictions = np.array(predictions)
-    test_mse = np.mean((predictions - Y_test) ** 2)
-    print(f"Test MSE after 30 batches: {test_mse:.4f}")
-        
-        # 可视化预测 vs 真实值（适用于 1D 输出）
+    mse = np.mean((predictions - Y_test) ** 2)
+    var = np.var(Y_test)
+    smse = mse / (var + 1e-8)
+    print(f"Final Test SMSE: {smse:.6f}")
+
+    # 可视化预测结果
     plt.figure(figsize=(10, 5))
     plt.plot(Y_test[:200], label="True", marker='o', alpha=0.7)
     plt.plot(predictions[:200], label="Predicted", marker='x', alpha=0.7)
@@ -123,3 +129,4 @@ def train_loggp_on_sarcos():
 
 if __name__ == "__main__":
     train_loggp_on_sarcos()
+
