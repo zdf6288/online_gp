@@ -62,7 +62,7 @@ class OnlineGPTorch(torch.nn.Module):
                 self.optimizer.zero_grad()
                 loss = -self.marginal_log_likelihood()
                 loss.backward()
-                print(f"Loss: {loss.item()}")
+                # print(f"Loss: {loss.item()}")
                 self.optimizer.step()
 
     def marginal_log_likelihood(self):

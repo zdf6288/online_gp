@@ -18,7 +18,7 @@ def load_sarcos_data():
     X_test = test_data['sarcos_inv_test'][:, :21]
     Y_test = test_data['sarcos_inv_test'][:, 21:]
 
-    # 标准化
+    # Normalize
     X_mean, X_std = X_train.mean(0), X_train.std(0)
     Y_mean, Y_std = Y_train.mean(0), Y_train.std(0)
     X_train = (X_train - X_mean) / X_std
@@ -28,36 +28,38 @@ def load_sarcos_data():
     return X_train, Y_train, X_test, Y_test
 
 
-def train_loggp_on_sarcos():
+def train_loggp_on_sarcos(enable_pretraining=True,
+                          enable_online_optimization=True,
+                          pretrain_limit=1000,
+                          max_samples=6000):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     X_train, Y_train, X_test, Y_test = load_sarcos_data()
     x_dim, y_dim = X_train.shape[1], 1
-    Y_train, Y_test = Y_train[:, :1], Y_test[:, :1]  # 只预测第一个输出维度
+    Y_train, Y_test = Y_train[:, :1], Y_test[:, :1]  # 只使用第一个输出维度
 
     model = LoGGP_PyTorch(
         x_dim, y_dim,
-        max_data_per_expert=50,
-        max_experts=64,
-        lr=0.001,
-        steps=5,
+        max_data_per_expert=100,
+        max_experts=16,
+        lr=0.0001,
+        steps=100,
         device=device,
-        min_points_to_optimize=10,
-        optimize_every=10
+        min_points_to_optimize=20,
+        optimize_every=5,
+        enable_variance_cache=False
     )
 
-    smse_list = []
+    mse_list = []
     preds = []
     trues = []
     sample_count = 0
-    max_samples = 5000
-    pretrain_limit = 1000
-    report_every = 100  # 每 N 个样本输出一次平均 SMSE
-    window_preds, window_trues = [], []
+    report_every = 500
+    window_preds = []
+    window_trues = []
 
-    #开始训练
     print("Training (sample-wise)...")
-    
+
     for x, y in tqdm(zip(X_train, Y_train), total=min(len(X_train), max_samples)):
         if sample_count >= max_samples:
             break
@@ -65,55 +67,62 @@ def train_loggp_on_sarcos():
         x = x.reshape(-1)
         y = y.reshape(-1)
 
-        # 1. 预测
+        # 1. Predict
         pred, _ = model.predict(x, return_std=True)
         preds.append(pred)
         trues.append(y)
-        
         window_preds.append(pred)
         window_trues.append(y)
 
-        # 2. 更新模型
-        model.update_point(x, y, optimize=True)
+        # 2. Decide if optimize
+        if enable_pretraining and sample_count < pretrain_limit:
+            optimize = True
+        elif enable_online_optimization:
+            optimize = True
+        else:
+            optimize = False
 
-        # 3. 记录误差
-        smse = np.mean((pred - y) ** 2) / (np.var(y) + 1e-8)
-        smse_list.append(smse)
+        # 3. Update model
+        model.update_point(x, y, optimize=optimize)
+
+        # 4. Record MSE
+        mse = np.mean((pred - y) ** 2)
+        mse_list.append(mse)
         sample_count += 1
 
-        # 4. 每 report_every 样本输出 SMSE
         if sample_count % report_every == 0:
             window_preds_np = np.array(window_preds)
             window_trues_np = np.array(window_trues)
-            mse = np.mean((window_preds_np - window_trues_np) ** 2)
-            variance = np.var(window_trues_np)
-            window_smse = mse / (variance + 1e-8)
-            print(f"[Samples {sample_count - report_every + 1}–{sample_count}] Average SMSE: {window_smse:.6f}")
+            window_mse = np.mean((window_preds_np - window_trues_np) ** 2)
+            print(f"[Samples {sample_count - report_every + 1}–{sample_count}] Average MSE: {window_mse:.6f}")
             window_preds.clear()
             window_trues.clear()
 
-    # 绘制训练误差
+    # 🎯 Plot window-averaged MSE
+    window_size = 20
+    mse_list = np.array(mse_list)
+    prepoint_mse = [np.mean(mse_list[i:i+window_size]) for i in range(0, len(mse_list), window_size)]
+    prepoint_indices = list(range(window_size, len(mse_list) + 1, window_size))
+
     plt.figure(figsize=(10, 4))
-    plt.plot(smse_list, label='Sample-wise SMSE', alpha=0.7)
-    plt.title("Per-sample SMSE During Online Training")
+    plt.plot(prepoint_indices, prepoint_mse, marker='o', label='Avg MSE per window')
     plt.xlabel("Sample Index")
-    plt.ylabel("SMSE")
+    plt.ylabel("Average MSE")
+    plt.title("MSE over Samples (Window Averaged)")
     plt.grid(True)
     plt.legend()
     plt.tight_layout()
-    plt.savefig("train_smse_per_sample.png")
+    plt.savefig("prepoint_mse_plot.png")
     plt.show()
 
-    # 测试阶段
+    # ✅ Testing
     print("Testing...")
     predictions = [model.predict(x, return_std=False) for x in tqdm(X_test)]
     predictions = np.array(predictions)
-    mse = np.mean((predictions - Y_test) ** 2)
-    var = np.var(Y_test)
-    smse = mse / (var + 1e-8)
-    print(f"Final Test SMSE: {smse:.6f}")
+    test_mse = np.mean((predictions - Y_test) ** 2)
+    print(f"Final Test MSE: {test_mse:.6f}")
 
-    # 可视化预测结果
+    # 📈 Test prediction vs true
     plt.figure(figsize=(10, 5))
     plt.plot(Y_test[:200], label="True", marker='o', alpha=0.7)
     plt.plot(predictions[:200], label="Predicted", marker='x', alpha=0.7)
@@ -128,5 +137,9 @@ def train_loggp_on_sarcos():
 
 
 if __name__ == "__main__":
-    train_loggp_on_sarcos()
+    train_loggp_on_sarcos(
+        enable_pretraining=True,
+        enable_online_optimization=True,
+        pretrain_limit=500,
+        max_samples=5000)
 

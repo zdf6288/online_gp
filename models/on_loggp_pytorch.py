@@ -230,36 +230,101 @@ class LoGGP_PyTorch(nn.Module):
                         var = 1e6
                     self.k_diag[p * self.max_data + j, pos] = var
 
+    
+    def select_best_split_dimension(X, Y):
+        best_dim = -1
+        best_threshold = 0
+        best_gain = -np.inf
+        total_var = np.var(Y)
+
+        for d in range(X.shape[0]):
+            median = np.median(X[d])
+            left_mask = X[d] < median
+            right_mask = X[d] >= median
+
+            if np.sum(left_mask) < 2 or np.sum(right_mask) < 2:
+                continue  # 跳过无效划分
+
+            left_var = np.var(Y[:, left_mask])
+            right_var = np.var(Y[:, right_mask])
+            gain = total_var - (
+                left_mask.mean() * left_var + right_mask.mean() * right_var
+            )
+            if gain > best_gain:
+                best_gain = gain
+                best_dim = d
+                best_threshold = median
+
+        return best_dim, best_threshold
+
     def divide(self, model):
             if self.auxUbic[-1] != -1:
                 # print("no room for more divisions")
                 return
-            # compute widths in all dimensions
-            width = self.X[:, self.auxUbic[model] * self.max_data: self.auxUbic[model] *
-                                                            self.max_data + self.max_data].max(axis=1) - self.X[:,
-                                                                                                self.auxUbic[model] *
-                                                                                                self.max_data: self.auxUbic[
-                                                                                                            model] * self.max_data + self.max_data].min(
-                axis=1)
+            # # compute widths in all dimensions
+            # width = self.X[:, self.auxUbic[model] * self.max_data: self.auxUbic[model] *
+            #                                                 self.max_data + self.max_data].max(axis=1) - self.X[:,
+            #                                                                                     self.auxUbic[model] *
+            #                                                                                     self.max_data: self.auxUbic[
+            #                                                                                                 model] * self.max_data + self.max_data].min(
+            #     axis=1)
 
-            # obtain cutting dimension
-            cutD = np.argmax(width)
-            width = width.max()
-            # compute hyperplane
-            mP = (self.X[cutD, self.auxUbic[model] * self.max_data: self.auxUbic[model] *
-                                                            self.max_data + self.max_data].max() + self.X[cutD,
-                                                                                            self.auxUbic[model] *
-                                                                                            self.max_data: self.auxUbic[
-                                                                                                        model] * self.max_data + self.max_data].min()) / 2
+            # # obtain cutting dimension
+            # cutD = np.argmax(width)
+            # width = width.max()
+            # # compute hyperplane
+            # mP = (self.X[cutD, self.auxUbic[model] * self.max_data: self.auxUbic[model] *
+            #                                                 self.max_data + self.max_data].max() + self.X[cutD,
+            #                                                                                 self.auxUbic[model] *
+            #                                                                                 self.max_data: self.auxUbic[
+            #                                                                                             model] * self.max_data + self.max_data].min()) / 2
 
-            # get overlapping region
+            # # get overlapping region
+            # o = width / self.wo
+            # if o == 0:
+            #     o = 0.1
+
+            # self.medians[model] = mP  # set model hyperplane
+            # self.overlapD[model] = cutD  # cut dimension
+            # self.overlapW[model] = o  # width of overlap
+            
+            X_block = self.X[:, self.auxUbic[model] * self.max_data:
+                    self.auxUbic[model] * self.max_data + self.max_data]
+
+            best_score = float('inf')
+            cutD = -1
+            mP = 0
+
+            for d in range(self.x_dim):
+                sorted_vals = X_block[d, :]
+                median = np.median(sorted_vals)
+                
+                left_mask = sorted_vals < median
+                right_mask = sorted_vals >= median
+                
+                if np.sum(left_mask) == 0 or np.sum(right_mask) == 0:
+                    continue  # 忽略无法分的维度
+
+                left_var = np.var(sorted_vals[left_mask])
+                right_var = np.var(sorted_vals[right_mask])
+                
+                weighted_var = (np.sum(left_mask) * left_var + np.sum(right_mask) * right_var) / self.max_data
+
+                if weighted_var < best_score:
+                    best_score = weighted_var
+                    cutD = d
+                    mP = median
+
+            # 3. 覆盖宽度定义方式不变（保持兼容）
+            width = X_block[cutD, :].max() - X_block[cutD, :].min()
             o = width / self.wo
             if o == 0:
                 o = 0.1
 
-            self.medians[model] = mP  # set model hyperplane
-            self.overlapD[model] = cutD  # cut dimension
-            self.overlapW[model] = o  # width of overlap
+            # 4. 赋值
+            self.medians[model] = mP
+            self.overlapD[model] = cutD
+            self.overlapW[model] = o
 
             xL = np.zeros([self.x_dim, self.max_data], dtype=float)
             xR = np.zeros([self.x_dim, self.max_data], dtype=float)
@@ -400,10 +465,15 @@ class LoGGP_PyTorch(nn.Module):
                 loss = self.nll_loss(x_data, y_data, model_id, p)
                 loss.backward()
                 optimizer.step()
+                
+                # with torch.no_grad():
+                #     self.model_params[model_id]['log_sigma_f'].clamp_(min=-2.0, max=2.0)
+                #     self.model_params[model_id]['log_sigma_n'].clamp_(min=-3.0, max=1.0)
+                #     self.model_params[model_id]['log_lengthscale'].clamp_(min=-3.0, max=3.0)
 
     def nll_loss(self, x_data, y_data, model_id, output_dim):
         params = self.model_params[model_id]
-        sigma_f = torch.exp(params['log_sigma_f'][output_dim])
+        sigma_f = torch.exp(params['log_sigma_f'][output_dim])  
         sigma_n = torch.exp(params['log_sigma_n'][output_dim])
         lengthscale = torch.exp(params['log_lengthscale'][:, output_dim])
         X = torch.tensor(x_data.T, dtype=torch.float64, device=self.device)
