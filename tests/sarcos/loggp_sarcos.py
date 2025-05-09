@@ -29,7 +29,7 @@ def load_sarcos_data():
 
 
 def train_loggp_on_sarcos(enable_pretraining=True,
-                          enable_online_optimization=True,
+                          enable_online_optimization=False,
                           pretrain_limit=1000,
                           max_samples=6000):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -40,13 +40,13 @@ def train_loggp_on_sarcos(enable_pretraining=True,
 
     model = LoGGP_PyTorch(
         x_dim, y_dim,
-        max_data_per_expert=100,
-        max_experts=16,
+        max_data_per_expert=50,
+        max_experts=32,
         lr=0.0001,
         steps=100,
         device=device,
-        min_points_to_optimize=20,
-        optimize_every=5,
+        min_points_to_optimize=10,
+        optimize_every=10,
         enable_variance_cache=False
     )
 
@@ -140,6 +140,6 @@ if __name__ == "__main__":
     train_loggp_on_sarcos(
         enable_pretraining=True,
         enable_online_optimization=True,
-        pretrain_limit=500,
-        max_samples=5000)
+        pretrain_limit=2000,
+        max_samples=10000)
 

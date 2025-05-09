@@ -12,7 +12,8 @@ from tools.to_tensor_2d import to_tensor_2d
 
 
 class LoGGP_PyTorch(nn.Module):
-    def __init__(self, x_dim, y_dim, max_data_per_expert=50, max_experts=4, lr=0.0005, steps=10, min_points_to_optimize=10, optimize_every=10, device=None, enable_variance_cache=False):
+    def __init__(self, x_dim, y_dim, max_data_per_expert=50, max_experts=4, lr=0.0005, steps=10, min_points_to_optimize=10, 
+                 optimize_every=10, device=None, enable_variance_cache=False):
         super().__init__()
         self.device = device or torch.device("cpu")
         self.x_dim = x_dim
@@ -46,10 +47,9 @@ class LoGGP_PyTorch(nn.Module):
         
         self.enable_variance_cache = enable_variance_cache
         self.k_diag = np.full((y_dim * max_data_per_expert, max_experts), np.nan)  # 初始化为 NaN，表示未缓存
-    
 
         self.data_index_queue = [deque() for _ in range(2 * max_experts - 1)]
-
+        
     def init_model_params(self, model_id):
         log_sigma_f = nn.Parameter(torch.randn(self.y_dim, device=self.device) * 0.1)
         log_sigma_n = nn.Parameter(torch.randn(self.y_dim, device=self.device) * 0.1 - 2.0)
@@ -108,84 +108,62 @@ class LoGGP_PyTorch(nn.Module):
     def add_point(self, x, y, model, step_id=None, optimize=True):
         if model not in self.model_params:
             self.init_model_params(model)
+
         pos = self.auxUbic[model]
         idx = self.localCount[model]
 
         if idx < self.max_data:
-            # 1. Expert not full → directly add
+            # Expert not full → direct add
             write_idx = idx
-            self.X[:, pos * self.max_data + idx] = x
-            self.Y[:, pos * self.max_data + idx] = y
+            self.X[:, pos * self.max_data + write_idx] = x
+            self.Y[:, pos * self.max_data + write_idx] = y
             self.localCount[model] += 1
             self.data_index_queue[model].append(write_idx)
             self.update_kernel(x, y, model)
-        
-        if idx == self.max_data:
-            if self.auxUbic[-1] != -1:
-                self.entropy_based_replace(x, y, model)
-            
-                # return
-                # replace_idx = self.data_index_queue[model].popleft()
-                # self.X[:, pos * self.max_data + replace_idx] = x
-                # self.Y[:, pos * self.max_data + replace_idx] = y
-                # self.update_kernel(x, y, model)
-                # self.data_index_queue[model].append(replace_idx)              
-            else:
-                #Full expert → divide
+
+        elif idx == self.max_data:
+            # Expert full → decide whether to divide or replace
+            is_leaf = self.children[0, model] == -1 and self.children[1, model] == -1
+            has_space = -1 in self.auxUbic
+
+            if is_leaf and has_space:
                 self.divide(model)
+            else:
+                # fallback to FIFO or entropy-based replace
+                self.fifo_based_replace(x, y, model)
 
-        # 2. Update the model parameters
-        if optimize and self.localCount[model] >= self.min_points_to_optimize:
-            self.update_counters[model] += 1
-            if self.update_counters[model] % self.optimize_every == 0:
-                self.optimize_model(model)
+        # GP parameter updat
+        if self.localCount[model] <= self.max_data:        
+            if optimize and self.localCount[model] >= self.min_points_to_optimize:
+                self.update_counters[model] += 1
+                if self.update_counters[model] % self.optimize_every == 0:
+                    self.optimize_model(model)
+
 
         
-    def entropy_based_replace(self, x, y, model):
+    def fifo_based_replace(self, x, y, model):
         """
-        Replace the least informative point in the expert using entropy (variance) as proxy.
-        Now with k(xi, xi) cached to avoid recomputation.
+        FIFO 替换策略：
+        替换当前专家中最早加入的数据点（队头），使模型快速响应新数据。
         """
         pos = self.auxUbic[model]
-        n = self.max_data
-        min_entropy = float('inf')
-        replace_idx = -1
 
-        X_all = self.X[:, pos * self.max_data: pos * self.max_data + n]
-        
-        for i in range(n):
-            x_i = self.X[:, pos * self.max_data + i].reshape(-1, 1)
+        # 如果队列为空（不应该发生），回退到随机替换
+        if not self.data_index_queue[model]:
+            replace_idx = np.random.randint(0, self.max_data)
+        else:
+            # 获取并移除最旧的数据点索引
+            replace_idx = self.data_index_queue[model].popleft()
 
-            if self.enable_variance_cache:
-                var = self.k_diag[0 * self.max_data + i, pos]
-                if not np.isnan(var):
-                    # 缓存命中，直接使用
-                    pass
-                else:
-                    # 重新计算并写入缓存
-                    k_xx = self.kernel(x_i.T, x_i.T, 0, model).item()
-                    X_all = self.X[:, pos * self.max_data: pos * self.max_data + n]
-                    kval = self.kernel(X_all.T, x_i.T, 0, model).cpu().numpy()
-                    var = k_xx - np.dot(kval, kval.T).item()
-                    var = max(var, 1e-6)
-                    self.k_diag[0 * self.max_data + i, pos] = var
-            else:
-                # 不使用缓存，直接计算
-                k_xx = self.kernel(x_i.T, x_i.T, 0, model).item()
-                X_all = self.X[:, pos * self.max_data: pos * self.max_data + n]
-                kval = self.kernel(X_all.T, x_i.T, 0, model).cpu().numpy()
-                var = k_xx - np.dot(kval, kval.T).item()
-                var = max(var, 1e-6)
-
-            if var < min_entropy:
-                min_entropy = var
-                replace_idx = i
-
-        # Replace data and update kernel
+        # 替换数据点
         self.X[:, pos * self.max_data + replace_idx] = x
         self.Y[:, pos * self.max_data + replace_idx] = y
+
+        # 更新核矩阵和 alpha
         self.update_kernel(x, y, model)
 
+        # 将新样本位置压入队列末尾
+        self.data_index_queue[model].append(replace_idx)
 
     def update_kernel(self, x, y, model):
         pos = self.auxUbic[model]
@@ -260,71 +238,35 @@ class LoGGP_PyTorch(nn.Module):
     def divide(self, model):
             if self.auxUbic[-1] != -1:
                 # print("no room for more divisions")
+                
                 return
-            # # compute widths in all dimensions
-            # width = self.X[:, self.auxUbic[model] * self.max_data: self.auxUbic[model] *
-            #                                                 self.max_data + self.max_data].max(axis=1) - self.X[:,
-            #                                                                                     self.auxUbic[model] *
-            #                                                                                     self.max_data: self.auxUbic[
-            #                                                                                                 model] * self.max_data + self.max_data].min(
-            #     axis=1)
+            # compute widths in all dimensions
+            width = self.X[:, self.auxUbic[model] * self.max_data: self.auxUbic[model] *
+                                                            self.max_data + self.max_data].max(axis=1) - self.X[:,
+                                                                                                self.auxUbic[model] *
+                                                                                                self.max_data: self.auxUbic[
+                                                                                                            model] * self.max_data + self.max_data].min(
+                axis=1)
 
-            # # obtain cutting dimension
-            # cutD = np.argmax(width)
-            # width = width.max()
-            # # compute hyperplane
-            # mP = (self.X[cutD, self.auxUbic[model] * self.max_data: self.auxUbic[model] *
-            #                                                 self.max_data + self.max_data].max() + self.X[cutD,
-            #                                                                                 self.auxUbic[model] *
-            #                                                                                 self.max_data: self.auxUbic[
-            #                                                                                             model] * self.max_data + self.max_data].min()) / 2
+            # obtain cutting dimension
+            cutD = np.argmax(width)
+            width = width.max()
+            # compute hyperplane
+            mP = (self.X[cutD, self.auxUbic[model] * self.max_data: self.auxUbic[model] *
+                                                            self.max_data + self.max_data].max() + self.X[cutD,
+                                                                                            self.auxUbic[model] *
+                                                                                            self.max_data: self.auxUbic[
+                                                                                                        model] * self.max_data + self.max_data].min()) / 2
 
-            # # get overlapping region
-            # o = width / self.wo
-            # if o == 0:
-            #     o = 0.1
-
-            # self.medians[model] = mP  # set model hyperplane
-            # self.overlapD[model] = cutD  # cut dimension
-            # self.overlapW[model] = o  # width of overlap
-            
-            X_block = self.X[:, self.auxUbic[model] * self.max_data:
-                    self.auxUbic[model] * self.max_data + self.max_data]
-
-            best_score = float('inf')
-            cutD = -1
-            mP = 0
-
-            for d in range(self.x_dim):
-                sorted_vals = X_block[d, :]
-                median = np.median(sorted_vals)
-                
-                left_mask = sorted_vals < median
-                right_mask = sorted_vals >= median
-                
-                if np.sum(left_mask) == 0 or np.sum(right_mask) == 0:
-                    continue  # 忽略无法分的维度
-
-                left_var = np.var(sorted_vals[left_mask])
-                right_var = np.var(sorted_vals[right_mask])
-                
-                weighted_var = (np.sum(left_mask) * left_var + np.sum(right_mask) * right_var) / self.max_data
-
-                if weighted_var < best_score:
-                    best_score = weighted_var
-                    cutD = d
-                    mP = median
-
-            # 3. 覆盖宽度定义方式不变（保持兼容）
-            width = X_block[cutD, :].max() - X_block[cutD, :].min()
+            # get overlapping region
             o = width / self.wo
             if o == 0:
                 o = 0.1
 
-            # 4. 赋值
-            self.medians[model] = mP
-            self.overlapD[model] = cutD
-            self.overlapW[model] = o
+            self.medians[model] = mP  # set model hyperplane
+            self.overlapD[model] = cutD  # cut dimension
+            self.overlapW[model] = o  # width of overlap
+    
 
             xL = np.zeros([self.x_dim, self.max_data], dtype=float)
             xR = np.zeros([self.x_dim, self.max_data], dtype=float)
